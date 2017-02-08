@@ -11,7 +11,7 @@
 #endif
 
 #include <llvm/Config/llvm-config.h>
-#if (LLVM_VERSION_MINOR < 5)
+#if ((LLVM_VERSION_MAJOR == 3) && (LLVM_VERSION_MINOR < 5))
  #include <llvm/Support/CFG.h>
 #else
  #include <llvm/IR/CFG.h>
@@ -42,54 +42,6 @@
 namespace dg {
 namespace analysis {
 namespace rd {
-
-#if 0
-#include <iostream>
-#include <sstream>
-#include <fstream>
-#include <string>
-
-static std::string
-getInstName(const llvm::Value *val)
-{
-    std::ostringstream ostr;
-    llvm::raw_os_ostream ro(ostr);
-
-    assert(val);
-    ro << *val;
-    ro.flush();
-
-    // break the string if it is too long
-    return ostr.str();
-}
-
-const char *__get_name(const llvm::Value *val, const char *prefix)
-{
-    static std::string buf;
-    buf.reserve(255);
-    buf.clear();
-
-    std::string nm = getInstName(val);
-    if (prefix)
-        buf.append(prefix);
-
-    buf.append(nm);
-
-    return buf.c_str();
-}
-
-{
-    const char *name = __get_name(val, prefix);
-}
-
-{
-    if (prefix) {
-        std::string nm;
-        nm.append(prefix);
-        nm.append(name);
-    } else
-}
-#endif
 
 static uint64_t getAllocatedSize(llvm::Type *Ty, const llvm::DataLayout *DL)
 {
@@ -265,7 +217,7 @@ static void getLocalVariables(const llvm::Function *F,
                 bool is_address_taken = false;
                 for (auto I = Inst.use_begin(), E = Inst.use_end();
                      I != E; ++I) {
-#if (LLVM_VERSION_MINOR < 5)
+#if ((LLVM_VERSION_MAJOR == 3) && (LLVM_VERSION_MINOR < 5))
                     const llvm::Value *use = *I;
 #else
                     const llvm::Value *use = I->getUser();
@@ -676,6 +628,11 @@ RDNode *LLVMRDBuilder::createUndefinedCall(const llvm::CallInst *CInst)
     RDNode *node = new RDNode(CALL);
     addNode(CInst, node);
 
+    // if we assume that undefined functions are pure
+    // (have no side effects), we can bail out here
+    if (assume_pure_functions)
+        return node;
+
     // every pointer we pass into the undefined call may be defined
     // in the function
     for (unsigned int i = 0; i < CInst->getNumArgOperands(); ++i) {
@@ -715,6 +672,10 @@ RDNode *LLVMRDBuilder::createUndefinedCall(const llvm::CallInst *CInst)
             node->addDef(target, UNKNOWN_OFFSET, UNKNOWN_OFFSET);
         }
     }
+
+    // XXX: to be completely correct, we should assume also modification
+    // of all global variables, so we should perform a write to
+    // unknown memory instead of the loop above
 
     return node;
 }
@@ -890,17 +851,17 @@ LLVMRDBuilder::createCall(const llvm::Instruction *Inst)
             const pta::Pointer& ptr = *(op->pointsTo.begin());
             if (ptr.isValid()) {
                 const llvm::Value *valF = ptr.target->getUserData<llvm::Value>();
-                const llvm::Function *F = llvm::cast<llvm::Function>(valF);
+                if (const llvm::Function *F = llvm::dyn_cast<llvm::Function>(valF)) {
+                    if (F->size() == 0) {
+                        RDNode *n = createUndefinedCall(CInst);
+                        return std::make_pair(n, n);
+                    } else if (llvmutils::callIsCompatible(F, CInst)) {
+                        std::pair<RDNode *, RDNode *> cf = createCallToFunction(F);
+                        dummy_nodes.push_back(cf.first);
 
-                if (F->size() == 0) {
-                    RDNode *n = createUndefinedCall(CInst);
-                    return std::make_pair(n, n);
-                } else if (llvmutils::callIsCompatible(F, CInst)) {
-                    std::pair<RDNode *, RDNode *> cf = createCallToFunction(F);
-                    dummy_nodes.push_back(cf.first);
-
-                    call_funcptr = cf.first;
-                    ret_call = cf.second;
+                        call_funcptr = cf.first;
+                        ret_call = cf.second;
+                    }
                 }
             }
         }

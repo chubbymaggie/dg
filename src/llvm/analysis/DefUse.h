@@ -26,10 +26,12 @@ class LLVMDefUseAnalysis : public analysis::DataFlowAnalysis<LLVMNode>
     LLVMReachingDefinitions *RD;
     LLVMPointerAnalysis *PTA;
     const llvm::DataLayout *DL;
+    bool assume_pure_functions;
 public:
     LLVMDefUseAnalysis(LLVMDependenceGraph *dg,
                        LLVMReachingDefinitions *rd,
-                       LLVMPointerAnalysis *pta);
+                       LLVMPointerAnalysis *pta,
+                       bool assume_pure_functions = false);
     ~LLVMDefUseAnalysis() { delete DL; }
 
     /* virtual */
@@ -44,6 +46,12 @@ private:
                            const llvm::Value *where, /* in CFG */
                            const llvm::Value *ptrOp,
                            uint64_t size);
+
+    void addDataDependence(LLVMNode *node,
+                           const llvm::Value *where, /* in CFG */
+                           PSNode *pts, /* what memory */
+                           uint64_t size);
+
     void addDataDependence(LLVMNode *node, analysis::rd::RDNode *rd);
     void addDataDependence(LLVMNode *node, llvm::Value *val);
 
@@ -53,6 +61,7 @@ private:
     void handleCallInst(LLVMNode *);
     void handleInlineAsm(LLVMNode *callNode);
     void handleIntrinsicCall(LLVMNode *callNode, llvm::CallInst *CI);
+    void handleUndefinedCall(LLVMNode *callNode, llvm::CallInst *CI);
 };
 
 } // namespace dg

@@ -12,7 +12,7 @@
 
 #include <llvm/Config/llvm-config.h>
 
-#if (LLVM_VERSION_MINOR < 5)
+#if ((LLVM_VERSION_MAJOR == 3) && (LLVM_VERSION_MINOR < 5))
  #include <llvm/Support/CFG.h>
 #else
  #include <llvm/IR/CFG.h>
@@ -553,6 +553,8 @@ LLVMPointerSubgraphBuilder::createRealloc(const llvm::CallInst *CInst)
     PSNode *reall = new PSNode(pta::DYN_ALLOC);
     // copy everything that is in orig_mem to reall
     PSNode *mcp = new PSNode(pta::MEMCPY, orig_mem, reall, 0, UNKNOWN_OFFSET);
+    // we need the pointer in the last node that we return
+    PSNode *ptr = new PSNode(pta::CONSTANT, reall, 0);
 
     reall->setIsHeap();
     reall->setSize(getConstantValue(CInst->getOperand(1)));
@@ -560,9 +562,12 @@ LLVMPointerSubgraphBuilder::createRealloc(const llvm::CallInst *CInst)
         reall->setZeroInitialized();
 
     reall->addSuccessor(mcp);
+    mcp->addSuccessor(ptr);
 
-    PSNodesSeq ret = PSNodesSeq(reall, mcp);
-    addNode(CInst, ret);
+    reall->setUserData(const_cast<llvm::CallInst *>(CInst));
+
+    PSNodesSeq ret = PSNodesSeq(reall, ptr);
+    addNode(CInst, ptr);
 
     return ret;
 }
@@ -734,18 +739,27 @@ LLVMPointerSubgraphBuilder::createVarArg(const llvm::IntrinsicInst *Inst)
     // it uses for storing the va arguments. Strip it so that we'll
     // get the underlying alloca inst
     PSNode *op = getOperand(Inst->getOperand(0)->stripInBoundsOffsets());
-    assert(op->getType() == pta::ALLOC
-           && "Argument of vastart is not an alloca");
+    // the argument is usually an alloca, but it may be a load
+    // in the case the code was transformed by -reg2mem
+    assert((op->getType() == pta::ALLOC || op->getType() == pta::LOAD)
+           && "Argument of vastart is invalid");
     // get node with the same pointer, but with UNKNOWN_OFFSET
     // FIXME: we're leaking it
     // make the memory in alloca point to our memory in vastart
-    PSNode *ptr = new PSNode(pta::CONSTANT, op, UNKNOWN_OFFSET);
+    PSNode *ptr = new PSNode(pta::GEP, op, UNKNOWN_OFFSET);
     PSNode *S1 = new PSNode(pta::STORE, vastart, ptr);
     // and also make vastart point to the vararg args
     PSNode *S2 = new PSNode(pta::STORE, arg, vastart);
 
-    vastart->addSuccessor(S1);
+    vastart->addSuccessor(ptr);
+    ptr->addSuccessor(S1);
     S1->addSuccessor(S2);
+
+    // set paired node to S2 for vararg, so that when adding structure,
+    // we add the whole sequence (it adds from call-node to pair-node,
+    // because of the old system where we did not store all sequences)
+    // FIXME: fix this
+    vastart->setPairedNode(S2);
 
     // FIXME: we're assuming that in a sequence in the nodes_map
     // is always the last node the 'real' node. In this case it is not true,
@@ -1015,10 +1029,7 @@ void LLVMPointerSubgraphBuilder::addPHIOperands(const llvm::Function &F)
 PSNode *LLVMPointerSubgraphBuilder::createCast(const llvm::Instruction *Inst)
 {
     const llvm::Value *op = Inst->getOperand(0);
-    PSNode *op1 = tryGetOperand(op);
-    if (!op1)
-        op1 = UNKNOWN_MEMORY;
-
+    PSNode *op1 = getOperand(op);
     PSNode *node = new PSNode(pta::CAST, op1);
 
     addNode(Inst, node);
@@ -1187,7 +1198,8 @@ PSNode *LLVMPointerSubgraphBuilder::createReturn(const llvm::Instruction *Inst)
             || isConstantZero(retVal))
             op1 = NULLPTR;
         else if (typeCanBePointer(retVal->getType()) &&
-                  !isInvalid(retVal->stripPointerCasts()))
+                  (!isInvalid(retVal->stripPointerCasts()) ||
+                   llvm::isa<llvm::ConstantExpr>(retVal)))
             op1 = getOperand(retVal);
     }
 
@@ -1207,7 +1219,7 @@ void LLVMPointerSubgraphBuilder::transitivelyBuildUses(const llvm::Value *val)
     assert(!isa<ConstantInt>(val) && "Tried building uses of constant int");
 
     for (auto I = val->use_begin(), E = val->use_end(); I != E; ++I) {
-#if (LLVM_VERSION_MINOR < 5)
+#if ((LLVM_VERSION_MAJOR == 3) && (LLVM_VERSION_MINOR < 5))
         const llvm::Value *use = *I;
 #else
         const llvm::Value *use = I->getUser();
@@ -1379,6 +1391,7 @@ LLVMPointerSubgraphBuilder::buildInstruction(const llvm::Instruction& Inst)
         case Instruction::URem:
         case Instruction::SRem:
         case Instruction::FRem:
+        case Instruction::FPTrunc:
             // these instructions reinterpert the pointer,
             // nothing better we can do here (I think?)
             node = createUnknown(&Inst);
@@ -1404,6 +1417,7 @@ LLVMPointerSubgraphBuilder::buildInstruction(const llvm::Instruction& Inst)
         default:
             llvm::errs() << Inst << "\n";
             assert(0 && "Unhandled instruction");
+            node = createUnknown(&Inst);
     }
 
     return std::make_pair(node, node);
@@ -1652,7 +1666,7 @@ void LLVMPointerSubgraphBuilder::addArgumentOperands(const llvm::Function *F,
     using namespace llvm;
 
     for (auto I = F->use_begin(), E = F->use_end(); I != E; ++I) {
-#if (LLVM_VERSION_MINOR < 5)
+#if ((LLVM_VERSION_MAJOR == 3) && (LLVM_VERSION_MINOR < 5))
         const Value *use = *I;
 #else
         const Value *use = I->getUser();
@@ -1699,7 +1713,7 @@ void LLVMPointerSubgraphBuilder::addVariadicArgumentOperands(const llvm::Functio
     using namespace llvm;
 
     for (auto I = F->use_begin(), E = F->use_end(); I != E; ++I) {
-#if (LLVM_VERSION_MINOR < 5)
+#if ((LLVM_VERSION_MAJOR == 3) && (LLVM_VERSION_MINOR < 5))
         const Value *use = *I;
 #else
         const Value *use = I->getUser();
@@ -1754,7 +1768,7 @@ void LLVMPointerSubgraphBuilder::addReturnNodeOperand(const llvm::Function *F, P
     using namespace llvm;
 
     for (auto I = F->use_begin(), E = F->use_end(); I != E; ++I) {
-#if (LLVM_VERSION_MINOR < 5)
+#if ((LLVM_VERSION_MAJOR == 3) && (LLVM_VERSION_MINOR < 5))
         const Value *use = *I;
 #else
         const Value *use = I->getUser();

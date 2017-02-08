@@ -68,10 +68,12 @@ static void addReturnEdge(LLVMNode *callNode, LLVMDependenceGraph *subgraph)
 
 LLVMDefUseAnalysis::LLVMDefUseAnalysis(LLVMDependenceGraph *dg,
                                        LLVMReachingDefinitions *rd,
-                                       LLVMPointerAnalysis *pta)
+                                       LLVMPointerAnalysis *pta,
+                                       bool assume_pure_funs)
     : analysis::DataFlowAnalysis<LLVMNode>(dg->getEntryBB(),
                                            analysis::DATAFLOW_INTERPROCEDURAL),
-      dg(dg), RD(rd), PTA(pta), DL(new DataLayout(dg->getModule()))
+      dg(dg), RD(rd), PTA(pta), DL(new DataLayout(dg->getModule())),
+      assume_pure_functions(assume_pure_funs)
 {
     assert(PTA && "Need points-to information");
     assert(RD && "Need reaching definitions");
@@ -105,6 +107,7 @@ void LLVMDefUseAnalysis::handleInlineAsm(LLVMNode *callNode)
 void LLVMDefUseAnalysis::handleIntrinsicCall(LLVMNode *callNode,
                                              CallInst *CI)
 {
+    static std::set<Instruction *> warnings;
     IntrinsicInst *I = cast<IntrinsicInst>(CI);
     Value *dest, *src = nullptr;
 
@@ -121,9 +124,25 @@ void LLVMDefUseAnalysis::handleIntrinsicCall(LLVMNode *callNode,
         case Intrinsic::vastart:
             dest = I->getOperand(0);
             break;
+        case Intrinsic::vaend:
+        case Intrinsic::lifetime_start:
+        case Intrinsic::lifetime_end:
+        case Intrinsic::trap:
+        case Intrinsic::bswap:
+        case Intrinsic::prefetch:
+        case Intrinsic::objectsize:
+            // nothing to be done, direct def-use edges
+            // will be added later
+            return;
+        case Intrinsic::stacksave:
+        case Intrinsic::stackrestore:
+            if (warnings.insert(CI).second)
+                llvmutils::printerr("WARN: stack save/restore not implemented", CI);
+            return;
         default:
-            //assert(0 && "DEF-USE: Unhandled intrinsic call");
-            //handleUndefinedCall(callNode, CI);
+            I->dump();
+            assert(0 && "DEF-USE: Unhandled intrinsic call");
+            handleUndefinedCall(callNode, CI);
             return;
     }
 
@@ -135,6 +154,23 @@ void LLVMDefUseAnalysis::handleIntrinsicCall(LLVMNode *callNode,
 
     if (src)
         addDataDependence(callNode, CI, src, UNKNOWN_OFFSET /* FIXME */);
+}
+
+void LLVMDefUseAnalysis::handleUndefinedCall(LLVMNode *callNode, CallInst *CI)
+{
+    if (assume_pure_functions)
+        return;
+
+    // the function is undefined - add the top-level dependencies and
+    // also assume that this function use all the memory that is passed
+    // via the pointers
+    for (int e = CI->getNumArgOperands(), i = 0; i < e; ++i) {
+        if (auto pts = PTA->getPointsTo(CI->getArgOperand(i))) {
+            // the passed memory may be used in the undefined
+            // function on the unknown offset
+            addDataDependence(callNode, CI, pts, UNKNOWN_OFFSET);
+        }
+    }
 }
 
 void LLVMDefUseAnalysis::handleCallInst(LLVMNode *node)
@@ -149,23 +185,31 @@ void LLVMDefUseAnalysis::handleCallInst(LLVMNode *node)
     Function *func
         = dyn_cast<Function>(CI->getCalledValue()->stripPointerCasts());
     if (func) {
-        if (func->isIntrinsic() && !isa<DbgValueInst>(CI)) {
+        if (func->isIntrinsic() && !isa<DbgInfoIntrinsic>(CI)) {
             handleIntrinsicCall(node, CI);
             return;
         }
 
         // for realloc, we need to make it data dependent on the
         // memory it reallocates, since that is the memory it copies
-        if (strcmp(func->getName().data(), "realloc") == 0)
-            addDataDependence(node, CI, CI->getOperand(0), UNKNOWN_OFFSET /* FIXME */);
-    }
+        if (func->size() == 0) {
+            const char *name = func->getName().data();
+            if (strcmp(name, "realloc") == 0) {
+                addDataDependence(node, CI, CI->getOperand(0), UNKNOWN_OFFSET /* FIXME */);
+            } else if (strcmp(name, "malloc") == 0 ||
+                       strcmp(name, "calloc") == 0 ||
+                       strcmp(name, "alloca") == 0) {
+                // we do not want to do anything for the memory
+                // allocation functions
+            } else {
+                handleUndefinedCall(node, CI);
+            }
 
-    /*
-    if (func && func->size() == 0) {
-        handleUndefinedCall(node);
-        return;
+            // the function is undefined, so do not even try to
+            // add the edges from return statements
+            return;
+        }
     }
-    */
 
     // add edges from the return nodes of subprocedure
     // to the call (if the call returns something)
@@ -245,6 +289,7 @@ void LLVMDefUseAnalysis::addDataDependence(LLVMNode *node, PSNode *pts,
                                            RDNode *mem, uint64_t size)
 {
     using namespace dg::analysis;
+    static std::set<const llvm::Value *> reported_mappings;
 
     for (const pta::Pointer& ptr : pts->pointsTo) {
         if (!ptr.isValid())
@@ -255,7 +300,10 @@ void LLVMDefUseAnalysis::addDataDependence(LLVMNode *node, PSNode *pts,
 
         RDNode *val = RD->getNode(llvmVal);
         if(!val) {
-            llvmutils::printerr("Don't have mapping:\n  ", llvmVal);
+            if (reported_mappings.insert(llvmVal).second)
+                llvmutils::printerr("DEF-USE: no information for: ", llvmVal);
+
+            // XXX: shouldn't we set val to unknown location now?
             continue;
         }
 
@@ -309,15 +357,23 @@ void LLVMDefUseAnalysis::addDataDependence(LLVMNode *node,
                                            const llvm::Value *ptrOp,
                                            uint64_t size)
 {
-    using namespace dg::analysis;
-
     // get points-to information for the operand
-    pta::PSNode *pts = PTA->getPointsTo(ptrOp);
+    PSNode *pts = PTA->getPointsTo(ptrOp);
     //assert(pts && "Don't have points-to information for LoadInst");
     if (!pts) {
         llvmutils::printerr("ERROR: No points-to: ", ptrOp);
         return;
     }
+
+    addDataDependence(node, where, pts, size);
+}
+
+void LLVMDefUseAnalysis::addDataDependence(LLVMNode *node,
+                                           const llvm::Value *where, /* in CFG */
+                                           PSNode *pts, /* what memory */
+                                           uint64_t size)
+{
+    using namespace dg::analysis;
 
     // get the node from reaching definition where we have
     // all the reaching definitions

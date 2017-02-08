@@ -136,13 +136,13 @@ public:
 private:
     void addNode(const llvm::Value *val, PSNode *node)
     {
-        nodes_map[val] = std::make_pair(node, node);
+        nodes_map.emplace(val, std::make_pair(node, node));
         node->setUserData(const_cast<llvm::Value *>(val));
     }
 
     void addNode(const llvm::Value *val, PSNodesSeq seq)
     {
-        nodes_map[val] = seq;
+        nodes_map.emplace(val, seq);
         seq.second->setUserData(const_cast<llvm::Value *>(val));
     }
 
@@ -211,7 +211,10 @@ private:
 
 
     PSNode *handleGlobalVariableInitializer(const llvm::Constant *C,
-                                             PSNode *node);
+                                            PSNode *node,
+                                            PSNode *last = nullptr,
+                                            uint64_t offset = 0);
+
     PSNode *createMemTransfer(const llvm::IntrinsicInst *Inst);
 
     PSNodesSeq createMemSet(const llvm::Instruction *);
