@@ -29,26 +29,27 @@ public:
         }
     }
 
-    virtual void getMemoryObjects(PSNode *where, const Pointer& pointer,
-                                  std::vector<MemoryObject *>& objects)
+    void getMemoryObjects(PSNode *where, const Pointer& pointer,
+                          std::vector<MemoryObject *>& objects) override
     {
         // irrelevant in flow-insensitive
         (void) where;
         PSNode *n = pointer.target;
 
         // we want to have memory in allocation sites
-        if (n->getType() == pta::CAST || n->getType() == pta::GEP)
+        if (n->getType() == PSNodeType::CAST || n->getType() == PSNodeType::GEP)
             n = n->getOperand(0);
-        else if (n->getType() == pta::CONSTANT) {
+        else if (n->getType() == PSNodeType::CONSTANT) {
             assert(n->pointsTo.size() == 1);
             n = (n->pointsTo.begin())->target;
         }
 
-        if (n->getType() == pta::FUNCTION)
+        if (n->getType() == PSNodeType::FUNCTION)
             return;
 
-        assert(n->getType() == pta::ALLOC || n->getType() == pta::DYN_ALLOC
-               || n->getType() == pta::UNKNOWN_MEM);
+        assert(n->getType() == PSNodeType::ALLOC
+               || n->getType() == PSNodeType::DYN_ALLOC
+               || n->getType() == PSNodeType::UNKNOWN_MEM);
 
         MemoryObject *mo = n->getData<MemoryObject>();
         if (!mo) {
@@ -57,11 +58,6 @@ public:
         }
 
         objects.push_back(mo);
-    }
-
-    virtual void afterProcessed(PSNode *n)
-    {
-        (void) n;
     }
 };
 
